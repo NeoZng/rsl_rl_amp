@@ -309,8 +309,8 @@ class AMPModule:
                 "amp/discriminator_loss": 0.0,
                 "amp/expert_loss": 0.0,
                 "amp/policy_loss": 0.0,
-                "amp/valid_ratio": valid_ratio,
-                "amp/step_reward_mean": self._mean_scalar(
+                "Episode_Reward/amp_valid_ratio": valid_ratio,
+                "Episode_Reward/amp_step_reward_mean": self._mean_scalar(
                     self._amp_reward_sum / max(self._amp_reward_count, 1)
                 ),
             }
@@ -338,10 +338,12 @@ class AMPModule:
         for key in total:
             total[key] /= self.discriminator_updates
 
-        total["amp/valid_ratio"] = (self._valid_frames / self._total_frames) if self._total_frames > 0 else 0.0
+        total["Episode_Reward/amp_valid_ratio"] = (
+            self._valid_frames / self._total_frames
+        ) if self._total_frames > 0 else 0.0
         for key in total:
             total[key] = self._mean_scalar(total[key])
-        total["amp/step_reward_mean"] = self._mean_scalar(
+        total["Episode_Reward/amp_step_reward_mean"] = self._mean_scalar(
             self._amp_reward_sum / max(self._amp_reward_count, 1)
         )
         self._valid_frames = 0

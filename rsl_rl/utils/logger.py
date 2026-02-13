@@ -58,7 +58,6 @@ class Logger:
         self.use_amp = self.cfg.get("amp_cfg", None) is not None and self.cfg["amp_cfg"].get("enabled", False)
         if self.use_amp:
             self.amp_rewbuffer = deque(maxlen=100)
-            self.amp_rewbuffer_total = deque(maxlen=100)
             self.cur_amp_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
         # Decide whether to disable logging
@@ -141,7 +140,6 @@ class Logger:
                 ep_len = torch.clamp(self.cur_episode_length[new_ids][:, 0], min=1.0)
                 amp_mean_per_step = amp_total / ep_len
                 self.amp_rewbuffer.extend(amp_mean_per_step.cpu().numpy().tolist())
-                self.amp_rewbuffer_total.extend(amp_total.cpu().numpy().tolist())
                 self.cur_amp_reward_sum[new_ids] = 0
 
     def log(
@@ -193,14 +191,10 @@ class Logger:
                         self.writer.add_scalar("Episode/" + key, value, it)  # type: ignore
                         extras_string += f"""{f"Mean episode {key}:":>{pad}} {value:.4f}\n"""
 
-            # Log losses
-            reward_metric_keys = {"amp/step_reward_mean"}
-            episode_metric_keys = {"amp/valid_ratio"}
+            # Log losses and AMP episode-reward metrics by key prefix.
             for key, value in loss_dict.items():
-                if key in reward_metric_keys:
-                    self.writer.add_scalar(f"Episode_Reward/{key.split('/')[-1]}", value, it)
-                elif key in episode_metric_keys:
-                    self.writer.add_scalar(f"Episode/{key.split('/')[-1]}", value, it)
+                if key.startswith("Episode_Reward/"):
+                    self.writer.add_scalar(key, value, it)
                 else:
                     self.writer.add_scalar(f"Loss/{key}", value, it)
             self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
@@ -224,7 +218,6 @@ class Logger:
                 self.writer.add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
                 if self.use_amp and len(self.amp_rewbuffer) > 0:
                     self.writer.add_scalar("Episode_Reward/amp", statistics.mean(self.amp_rewbuffer), it)
-                    self.writer.add_scalar("Episode_Reward/amp_total", statistics.mean(self.amp_rewbuffer_total), it)
                 if self.logger_type != "wandb":
                     self.writer.add_scalar(
                         "Train/mean_reward/time", statistics.mean(self.rewbuffer), int(self.tot_time)
@@ -249,13 +242,9 @@ class Logger:
                 f"""{"Learning time:":>{pad}} {learn_time:.3f}s \n"""
             )
 
-            # Print losses
-            reward_metric_keys = {"amp/step_reward_mean"}
-            episode_metric_keys = {"amp/valid_ratio"}
+            # Print losses and AMP episode-reward metrics by key prefix.
             for key, value in loss_dict.items():
-                if key in reward_metric_keys:
-                    log_string += f"""{f"Mean {key}:":>{pad}} {value:.4f}\n"""
-                elif key in episode_metric_keys:
+                if key.startswith("Episode_Reward/"):
                     log_string += f"""{f"Mean {key}:":>{pad}} {value:.4f}\n"""
                 else:
                     log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
@@ -269,7 +258,6 @@ class Logger:
                 log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
                 if self.use_amp and len(self.amp_rewbuffer) > 0:
                     log_string += f"""{"Mean Episode_Reward/amp:":>{pad}} {statistics.mean(self.amp_rewbuffer):.2f}\n"""
-                    log_string += f"""{"Mean Episode_Reward/amp_total:":>{pad}} {statistics.mean(self.amp_rewbuffer_total):.2f}\n"""
 
             # Print noise std
             log_string += f"""{"Mean action noise std:":>{pad}} {action_std.mean().item():.2f}\n"""
