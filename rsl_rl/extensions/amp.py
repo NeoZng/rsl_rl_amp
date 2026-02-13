@@ -124,6 +124,31 @@ class _AMPDiscriminator(nn.Module):
         }
         return loss, metrics
 
+    def gradient_penalty(self, expert_sequences: torch.Tensor, policy_sequences: torch.Tensor) -> torch.Tensor:
+        """R1-style penalty on expert and policy inputs to keep logits smooth."""
+        expert_in = expert_sequences.detach().requires_grad_(True)
+        policy_in = policy_sequences.detach().requires_grad_(True)
+
+        expert_logits = self.forward(expert_in)
+        policy_logits = self.forward(policy_in)
+
+        expert_grad = torch.autograd.grad(
+            outputs=expert_logits.sum(),
+            inputs=expert_in,
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+        policy_grad = torch.autograd.grad(
+            outputs=policy_logits.sum(),
+            inputs=policy_in,
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+
+        expert_gp = expert_grad.square().sum(dim=-1).mean()
+        policy_gp = policy_grad.square().sum(dim=-1).mean()
+        return 0.5 * (expert_gp + policy_gp)
+
     def predict_reward(self, sequences: torch.Tensor) -> torch.Tensor:
         logits = self.forward(sequences)
         return torch.sigmoid(logits)
@@ -151,6 +176,7 @@ class AMPModule:
             self.step_dt = float(env.unwrapped.step_dt if hasattr(env, "unwrapped") else env.cfg.sim.dt)
         self.discriminator_updates = int(amp_cfg.get("discriminator_updates", 1))
         self.discriminator_batch_size = int(amp_cfg.get("discriminator_batch_size", 1024))
+        self.discriminator_grad_penalty_weight = float(amp_cfg.get("discriminator_grad_penalty_weight", 0.0))
         self.is_multi_gpu = bool(amp_cfg.get("multi_gpu_cfg", None))
         if self.is_multi_gpu:
             self.gpu_world_size = int(amp_cfg["multi_gpu_cfg"]["world_size"])
@@ -309,6 +335,7 @@ class AMPModule:
                 "amp/discriminator_loss": 0.0,
                 "amp/expert_loss": 0.0,
                 "amp/policy_loss": 0.0,
+                "amp/grad_penalty": 0.0,
                 "Episode_Reward/amp_valid_ratio": valid_ratio,
                 "Episode_Reward/amp_step_reward_mean": self._mean_scalar(
                     self._amp_reward_sum / max(self._amp_reward_count, 1)
@@ -319,6 +346,7 @@ class AMPModule:
             "amp/discriminator_loss": 0.0,
             "amp/expert_loss": 0.0,
             "amp/policy_loss": 0.0,
+            "amp/grad_penalty": 0.0,
         }
 
         for _ in range(self.discriminator_updates):
@@ -326,6 +354,11 @@ class AMPModule:
             policy = self.buffer.sample(self.discriminator_batch_size)
 
             loss, metrics = self.discriminator.compute_loss(expert_sequences=expert, policy_sequences=policy)
+            grad_penalty = torch.tensor(0.0, device=self.device)
+            if self.discriminator_grad_penalty_weight > 0.0:
+                grad_penalty = self.discriminator.gradient_penalty(expert_sequences=expert, policy_sequences=policy)
+                loss = loss + self.discriminator_grad_penalty_weight * grad_penalty
+            metrics["amp/grad_penalty"] = grad_penalty.detach().item()
 
             self.optimizer.zero_grad()
             loss.backward()
