@@ -5,6 +5,7 @@
 
 """Transitions storage for the learning algorithm."""
 
+from .amp_rollout_buffer import AMPRolloutBuffer
 from .rollout_storage import RolloutStorage
 
-__all__ = ["RolloutStorage"]
+__all__ = ["AMPRolloutBuffer", "RolloutStorage"]

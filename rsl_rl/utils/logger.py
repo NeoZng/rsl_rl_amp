@@ -54,6 +54,13 @@ class Logger:
             self.cur_ereward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             self.cur_ireward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
+        # AMP reward buffer (optional)
+        self.use_amp = self.cfg.get("amp_cfg", None) is not None and self.cfg["amp_cfg"].get("enabled", False)
+        if self.use_amp:
+            self.amp_rewbuffer = deque(maxlen=100)
+            self.amp_rewbuffer_total = deque(maxlen=100)
+            self.cur_amp_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
         # Decide whether to disable logging
         # Note: We only log from the process with rank 0 (main process)
         self.disable_logs = is_distributed and gpu_global_rank != 0
@@ -98,6 +105,7 @@ class Logger:
         dones: torch.Tensor,
         extras: dict,
         intrinsic_rewards: torch.Tensor | None = None,
+        amp_rewards: torch.Tensor | None = None,
     ) -> None:
         """Add metrics from the environment step to the buffers."""
         if self.log_dir is not None:
@@ -113,6 +121,8 @@ class Logger:
                 self.cur_reward_sum += rewards + intrinsic_rewards
             else:
                 self.cur_reward_sum += rewards
+            if self.use_amp and amp_rewards is not None:
+                self.cur_amp_reward_sum += amp_rewards
             self.cur_episode_length += 1
 
             # Clear data for completed episodes
@@ -126,6 +136,13 @@ class Logger:
                 self.irewbuffer.extend(self.cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                 self.cur_ereward_sum[new_ids] = 0
                 self.cur_ireward_sum[new_ids] = 0
+            if self.use_amp and amp_rewards is not None:
+                amp_total = self.cur_amp_reward_sum[new_ids][:, 0]
+                ep_len = torch.clamp(self.cur_episode_length[new_ids][:, 0], min=1.0)
+                amp_mean_per_step = amp_total / ep_len
+                self.amp_rewbuffer.extend(amp_mean_per_step.cpu().numpy().tolist())
+                self.amp_rewbuffer_total.extend(amp_total.cpu().numpy().tolist())
+                self.cur_amp_reward_sum[new_ids] = 0
 
     def log(
         self,
@@ -177,8 +194,15 @@ class Logger:
                         extras_string += f"""{f"Mean episode {key}:":>{pad}} {value:.4f}\n"""
 
             # Log losses
+            reward_metric_keys = {"amp/step_reward_mean"}
+            episode_metric_keys = {"amp/valid_ratio"}
             for key, value in loss_dict.items():
-                self.writer.add_scalar(f"Loss/{key}", value, it)
+                if key in reward_metric_keys:
+                    self.writer.add_scalar(f"Episode_Reward/{key.split('/')[-1]}", value, it)
+                elif key in episode_metric_keys:
+                    self.writer.add_scalar(f"Episode/{key.split('/')[-1]}", value, it)
+                else:
+                    self.writer.add_scalar(f"Loss/{key}", value, it)
             self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
 
             # Log noise std
@@ -198,6 +222,9 @@ class Logger:
                     self.writer.add_scalar("Rnd/weight", rnd_weight, it)  # type: ignore
                 self.writer.add_scalar("Train/mean_reward", statistics.mean(self.rewbuffer), it)
                 self.writer.add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
+                if self.use_amp and len(self.amp_rewbuffer) > 0:
+                    self.writer.add_scalar("Episode_Reward/amp", statistics.mean(self.amp_rewbuffer), it)
+                    self.writer.add_scalar("Episode_Reward/amp_total", statistics.mean(self.amp_rewbuffer_total), it)
                 if self.logger_type != "wandb":
                     self.writer.add_scalar(
                         "Train/mean_reward/time", statistics.mean(self.rewbuffer), int(self.tot_time)
@@ -223,8 +250,15 @@ class Logger:
             )
 
             # Print losses
+            reward_metric_keys = {"amp/step_reward_mean"}
+            episode_metric_keys = {"amp/valid_ratio"}
             for key, value in loss_dict.items():
-                log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
+                if key in reward_metric_keys:
+                    log_string += f"""{f"Mean {key}:":>{pad}} {value:.4f}\n"""
+                elif key in episode_metric_keys:
+                    log_string += f"""{f"Mean {key}:":>{pad}} {value:.4f}\n"""
+                else:
+                    log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
 
             # Print rewards and episode length
             if len(self.rewbuffer) > 0:
@@ -233,6 +267,9 @@ class Logger:
                     log_string += f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(self.irewbuffer):.2f}\n"""
                 log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
                 log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
+                if self.use_amp and len(self.amp_rewbuffer) > 0:
+                    log_string += f"""{"Mean Episode_Reward/amp:":>{pad}} {statistics.mean(self.amp_rewbuffer):.2f}\n"""
+                    log_string += f"""{"Mean Episode_Reward/amp_total:":>{pad}} {statistics.mean(self.amp_rewbuffer_total):.2f}\n"""
 
             # Print noise std
             log_string += f"""{"Mean action noise std:":>{pad}} {action_std.mean().item():.2f}\n"""

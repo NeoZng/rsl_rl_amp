@@ -11,6 +11,7 @@ import torch
 
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
+from rsl_rl.extensions import AMPModule
 from rsl_rl.models import MLPModel
 from rsl_rl.utils import resolve_callable
 from rsl_rl.utils.logger import Logger
@@ -26,12 +27,19 @@ class OnPolicyRunner:
         self.env = env
         self.cfg = train_cfg
         self.device = device
+        self.amp_module: AMPModule | None = None
 
         # Setup multi-GPU training if enabled
         self._configure_multi_gpu()
 
         # Query observations from the environment for algorithm construction
         obs = self.env.get_observations()
+
+        # Optional AMP module initialization
+        amp_cfg = self.cfg.get("amp_cfg")
+        if amp_cfg is not None and amp_cfg.get("enabled", False):
+            amp_cfg["multi_gpu_cfg"] = self.cfg["multi_gpu"]
+            self.amp_module = AMPModule(self.env, obs, amp_cfg, device=self.device)
 
         # Create the algorithm
         alg_class: type[PPO] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
@@ -66,6 +74,8 @@ class OnPolicyRunner:
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
+            if self.amp_module is not None:
+                self.amp_module.broadcast_parameters()
 
         # Initialize the logging writer
         self.logger.init_logging_writer()
@@ -81,15 +91,28 @@ class OnPolicyRunner:
                     # Sample actions
                     actions = self.alg.act(obs)
                     # Step the environment
-                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    next_obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    next_obs, rewards, dones = (
+                        next_obs.to(self.device),
+                        rewards.to(self.device),
+                        dones.to(self.device),
+                    )
+
+                    # Compute AMP reward and add to task reward
+                    if self.amp_module is not None:
+                        amp_rewards, amp_metrics = self.amp_module.process_transition(next_obs, dones)
+                        rewards = rewards + amp_rewards
+                    else:
+                        amp_rewards = None
+
                     # Process the step
-                    self.alg.process_env_step(obs, rewards, dones, extras)
+                    self.alg.process_env_step(next_obs, rewards, dones, extras)
                     # Extract intrinsic rewards if RND is used (only for logging)
-                    intrinsic_rewards = self.alg.intrinsic_rewards if self.cfg["algorithm"]["rnd_cfg"] else None
+                    intrinsic_rewards = self.alg.intrinsic_rewards if self.cfg["algorithm"].get("rnd_cfg") else None
                     # Book keeping
-                    self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
+                    self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards, amp_rewards)
+                    obs = next_obs
 
                 stop = time.time()
                 collect_time = stop - start
@@ -100,6 +123,8 @@ class OnPolicyRunner:
 
             # Update policy
             loss_dict = self.alg.update()
+            if self.amp_module is not None:
+                loss_dict.update(self.amp_module.update())
 
             stop = time.time()
             learn_time = stop - start
@@ -115,8 +140,10 @@ class OnPolicyRunner:
                 loss_dict=loss_dict,
                 learning_rate=self.alg.learning_rate,
                 action_std=self.alg.get_policy().output_std,
-                rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"]["rnd_cfg"] else None,
+                rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"].get("rnd_cfg") else None,
             )
+            if self.logger.writer is None and self.gpu_global_rank == 0:
+                print(f"[iter {it}] collection_time={collect_time:.3f}s learning_time={learn_time:.3f}s")
 
             # Save model
             if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
@@ -130,6 +157,8 @@ class OnPolicyRunner:
     def save(self, path: str, infos: dict | None = None) -> None:
         """Save the models and training state to a given path and upload them if external logging is used."""
         saved_dict = self.alg.save()
+        if self.amp_module is not None:
+            saved_dict["amp_state_dict"] = self.amp_module.state_dict()
         saved_dict["iter"] = self.current_learning_iteration
         saved_dict["infos"] = infos
         torch.save(saved_dict, path)
@@ -153,6 +182,11 @@ class OnPolicyRunner:
         """
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
+        if self.amp_module is not None and "amp_state_dict" in loaded_dict:
+            try:
+                self.amp_module.load_state_dict(loaded_dict["amp_state_dict"])
+            except Exception as err:
+                print(f"[WARN] AMP state load skipped due to incompatibility: {err}")
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
