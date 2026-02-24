@@ -241,11 +241,6 @@ class AMPModule:
             [torch.roll(order, shifts=-(k + 1), dims=0) for k in range(self.transition_frames)], dim=0
         )
 
-        self._valid_frames = 0
-        self._total_frames = 0
-        self._amp_reward_sum = 0.0
-        self._amp_reward_count = 0
-
     def broadcast_parameters(self) -> None:
         if not self.is_multi_gpu:
             return
@@ -288,12 +283,8 @@ class AMPModule:
         seq_batch = self.expert_padded[seq_ids.unsqueeze(1), time_idx]
         return seq_batch.reshape(batch_size, self.sequence_dim)
 
-    def process_transition(
-        self,
-        obs_tp1: TensorDict,
-        dones: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
-        """Process one env transition and return AMP reward."""
+    def process_transition(self, obs_tp1: TensorDict, dones: torch.Tensor) -> torch.Tensor:
+        """Process one env transition and return AMP reward tensor."""
         frames = obs_tp1[self.obs_group].to(self.device)
         dones_bool = dones.view(-1).bool().to(self.device)
 
@@ -313,33 +304,16 @@ class AMPModule:
         self.frame_count[dones_bool] = 0
         self.write_idx = (self.write_idx + 1) % self.transition_frames
 
-        self._valid_frames += int(valid_mask.sum().item())
-        self._total_frames += int(valid_mask.numel())
-
         amp_reward = self.reward_weight * self.step_dt * rewards
-        self._amp_reward_sum += float(amp_reward.sum().item())
-        self._amp_reward_count += int(amp_reward.numel())
-        metrics = {
-            "valid_ratio": float(valid_mask.float().mean().item()),
-            "amp_reward_mean": float(amp_reward.mean().item()),
-        }
-        return amp_reward, metrics
+        return amp_reward
 
     def update(self) -> dict[str, float]:
         if len(self.buffer) < self.discriminator_batch_size:
-            valid_ratio = (self._valid_frames / self._total_frames) if self._total_frames > 0 else 0.0
-            valid_ratio = self._mean_scalar(valid_ratio)
-            self._valid_frames = 0
-            self._total_frames = 0
             return {
                 "amp/discriminator_loss": 0.0,
                 "amp/expert_loss": 0.0,
                 "amp/policy_loss": 0.0,
                 "amp/grad_penalty": 0.0,
-                "Episode_Reward/amp_valid_ratio": valid_ratio,
-                "Episode_Reward/amp_step_reward_mean": self._mean_scalar(
-                    self._amp_reward_sum / max(self._amp_reward_count, 1)
-                ),
             }
 
         total = {
@@ -371,18 +345,8 @@ class AMPModule:
         for key in total:
             total[key] /= self.discriminator_updates
 
-        total["Episode_Reward/amp_valid_ratio"] = (
-            self._valid_frames / self._total_frames
-        ) if self._total_frames > 0 else 0.0
         for key in total:
             total[key] = self._mean_scalar(total[key])
-        total["Episode_Reward/amp_step_reward_mean"] = self._mean_scalar(
-            self._amp_reward_sum / max(self._amp_reward_count, 1)
-        )
-        self._valid_frames = 0
-        self._total_frames = 0
-        self._amp_reward_sum = 0.0
-        self._amp_reward_count = 0
         return total
 
     def state_dict(self) -> dict:

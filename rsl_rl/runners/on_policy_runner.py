@@ -101,7 +101,7 @@ class OnPolicyRunner:
 
                     # Compute AMP reward and add to task reward
                     if self.amp_module is not None:
-                        amp_rewards, amp_metrics = self.amp_module.process_transition(next_obs, dones)
+                        amp_rewards = self.amp_module.process_transition(next_obs, dones)
                         rewards = rewards + amp_rewards
                     else:
                         amp_rewards = None

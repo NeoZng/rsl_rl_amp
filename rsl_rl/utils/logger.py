@@ -39,6 +39,7 @@ class Logger:
         self.git_status_repos = [rsl_rl.__file__]
         self.tot_timesteps = 0
         self.tot_time = 0
+        self.policy_step_dt = self._resolve_policy_step_dt(env_cfg)
 
         # Create buffers
         self.ep_extras = []
@@ -126,8 +127,9 @@ class Logger:
 
             # Clear data for completed episodes
             new_ids = (dones > 0).nonzero(as_tuple=False)
+            done_ep_len = self.cur_episode_length[new_ids][:, 0].clone()
             self.rewbuffer.extend(self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-            self.lenbuffer.extend(self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+            self.lenbuffer.extend(done_ep_len.cpu().numpy().tolist())
             self.cur_reward_sum[new_ids] = 0
             self.cur_episode_length[new_ids] = 0
             if intrinsic_rewards is not None:
@@ -137,9 +139,10 @@ class Logger:
                 self.cur_ireward_sum[new_ids] = 0
             if self.use_amp and amp_rewards is not None:
                 amp_total = self.cur_amp_reward_sum[new_ids][:, 0]
-                ep_len = torch.clamp(self.cur_episode_length[new_ids][:, 0], min=1.0)
-                amp_mean_per_step = amp_total / ep_len
-                self.amp_rewbuffer.extend(amp_mean_per_step.cpu().numpy().tolist())
+                ep_len = torch.clamp(done_ep_len, min=1.0)
+                episode_duration_s = torch.clamp(ep_len * self.policy_step_dt, min=1.0e-6)
+                amp_per_second = amp_total / episode_duration_s
+                self.amp_rewbuffer.extend(amp_per_second.cpu().numpy().tolist())
                 self.cur_amp_reward_sum[new_ids] = 0
 
     def log(
@@ -324,3 +327,21 @@ class Logger:
                 # Add the file path to the list of files to be uploaded
                 files_to_upload.append(diff_file_name)
         return files_to_upload
+
+    @staticmethod
+    def _resolve_policy_step_dt(env_cfg: dict | object) -> float:
+        """Resolve policy step duration from env config as sim.dt * decimation."""
+        try:
+            if isinstance(env_cfg, dict):
+                sim = env_cfg.get("sim", {})
+                dt = float(sim.get("dt", 0.0))
+                decimation = float(env_cfg.get("decimation", 0.0))
+            else:
+                sim = getattr(env_cfg, "sim", None)
+                dt = float(getattr(sim, "dt", 0.0)) if sim is not None else 0.0
+                decimation = float(getattr(env_cfg, "decimation", 0.0))
+            if dt > 0.0 and decimation > 0.0:
+                return dt * decimation
+        except Exception:
+            pass
+        return 1.0
