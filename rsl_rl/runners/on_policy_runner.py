@@ -13,7 +13,7 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import AMPModule
 from rsl_rl.models import MLPModel
-from rsl_rl.utils import resolve_callable
+from rsl_rl.utils import check_nan, resolve_callable
 from rsl_rl.utils.logger import Logger
 
 
@@ -37,9 +37,10 @@ class OnPolicyRunner:
 
         # Optional AMP module initialization
         amp_cfg = self.cfg.get("amp_cfg")
-        if amp_cfg is not None and amp_cfg.get("enabled", False):
-            amp_cfg["multi_gpu_cfg"] = self.cfg["multi_gpu"]
-            self.amp_module = AMPModule(self.env, obs, amp_cfg, device=self.device)
+        if amp_cfg is not None:
+            amp_cfg_for_runner = dict(amp_cfg)
+            amp_cfg_for_runner["multi_gpu_cfg"] = self.cfg["multi_gpu"]
+            self.amp_module = AMPModule(self.env, obs, amp_cfg_for_runner, device=self.device)
 
         # Create the algorithm
         alg_class: type[PPO] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
@@ -92,6 +93,9 @@ class OnPolicyRunner:
                     actions = self.alg.act(obs)
                     # Step the environment
                     next_obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    # Check for NaN values from the environment
+                    if self.cfg.get("check_for_nan", True):
+                        check_nan(next_obs, rewards, dones)
                     # Move to device
                     next_obs, rewards, dones = (
                         next_obs.to(self.device),
@@ -146,12 +150,13 @@ class OnPolicyRunner:
                 print(f"[iter {it}] collection_time={collect_time:.3f}s learning_time={learn_time:.3f}s")
 
             # Save model
-            if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
+            if self.logger.writer is not None and it > 0 and it % self.cfg["save_interval"] == 0:
                 self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
 
         # Save the final model after training and stop the logging writer
-        if self.logger.writer is not None:
+        if self.logger.writer is not None and self.current_learning_iteration > 0:
             self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
+        if self.logger.writer is not None:
             self.logger.stop_logging_writer()
 
     def save(self, path: str, infos: dict | None = None) -> None:
@@ -162,6 +167,15 @@ class OnPolicyRunner:
         saved_dict["iter"] = self.current_learning_iteration
         saved_dict["infos"] = infos
         torch.save(saved_dict, path)
+        # Export ONNX together with every checkpoint for sim2sim deployment.
+        export_dir = os.path.join(os.path.dirname(path), "exported")
+        checkpoint_name = os.path.splitext(os.path.basename(path))[0]
+        try:
+            self.export_policy_to_onnx(export_dir, filename=f"{checkpoint_name}.onnx")
+            # Keep a stable latest filename for existing downstream tools.
+            self.export_policy_to_onnx(export_dir, filename="policy.onnx")
+        except Exception as err:
+            print(f"[WARN] Failed to export ONNX for checkpoint '{path}': {err}")
         # Upload model to external logging services
         self.logger.save_model(path, self.current_learning_iteration)
 

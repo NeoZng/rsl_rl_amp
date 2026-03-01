@@ -147,6 +147,7 @@ class PPO:
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
         # Update the normalizers
+        # TODO: Synchronize normalizer statistics across GPUs for consistent normalization in multi-GPU training.
         self.actor.update_normalization(obs)
         self.critic.update_normalization(obs)
         if self.rnd:
@@ -424,6 +425,7 @@ class PPO:
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
 
+        # TODO: Reduce scalar losses across GPUs for globally consistent logging metrics.
         return loss_dict
 
     def train_mode(self) -> None:
@@ -526,7 +528,7 @@ class PPO:
         self.actor.load_state_dict(model_params[0])
         self.critic.load_state_dict(model_params[1])
         if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[1])
+            self.rnd.predictor.load_state_dict(model_params[2])
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -538,6 +540,7 @@ class PPO:
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
         all_params = list(all_params)
+        # TODO: Add explicit empty-gradient handling before concatenation.
         grads = [param.grad.view(-1) for param in all_params if param.grad is not None]
         all_grads = torch.cat(grads)
         # Average the gradients across all GPUs

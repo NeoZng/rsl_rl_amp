@@ -97,6 +97,7 @@ class Distillation:
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
         # Update the normalizers
+        # TODO: Synchronize normalizer statistics across GPUs for consistent normalization in multi-GPU training.
         self.student.update_normalization(obs)
         # Record the rewards and dones
         self.transition.rewards = rewards
@@ -158,6 +159,7 @@ class Distillation:
         # Construct the loss dictionary
         loss_dict = {"behavior": mean_behavior_loss}
 
+        # TODO: Reduce scalar losses across GPUs for globally consistent logging metrics.
         return loss_dict
 
     def train_mode(self) -> None:
@@ -263,6 +265,7 @@ class Distillation:
         This function is called after the backward pass to synchronize the gradients across all GPUs.
         """
         # Create a tensor to store the gradients
+        # TODO: Add explicit empty-gradient handling before concatenation.
         grads = [param.grad.view(-1) for param in self.student.parameters() if param.grad is not None]
         all_grads = torch.cat(grads)
         # Average the gradients across all GPUs

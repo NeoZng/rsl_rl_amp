@@ -56,7 +56,8 @@ class Logger:
             self.cur_ireward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
         # AMP reward buffer (optional)
-        self.use_amp = self.cfg.get("amp_cfg", None) is not None and self.cfg["amp_cfg"].get("enabled", False)
+        # AMP is enabled whenever amp_cfg is provided.
+        self.use_amp = self.cfg.get("amp_cfg", None) is not None
         if self.use_amp:
             self.amp_rewbuffer = deque(maxlen=100)
             self.cur_amp_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
@@ -108,7 +109,7 @@ class Logger:
         amp_rewards: torch.Tensor | None = None,
     ) -> None:
         """Add metrics from the environment step to the buffers."""
-        if self.log_dir is not None:
+        if self.writer is not None:
             if "episode" in extras:
                 self.ep_extras.append(extras["episode"])
             elif "log" in extras:
@@ -164,7 +165,7 @@ class Logger:
 
         If videos are available, they are uploaded to the logging service (W&B) as well.
         """
-        if self.writer:
+        if self.writer is not None:
             collection_size = self.cfg["num_steps_per_env"] * self.num_envs * self.gpu_world_size
             iteration_time = collect_time + learn_time
             self.tot_timesteps += collection_size
@@ -231,7 +232,7 @@ class Logger:
 
             # Print to console
             log_string = f"""{"#" * width}\n"""
-            log_string += f"""\033[1m{f" Learning iteration {it}/{total_it} ".center(width)}\033[0m \n\n"""
+            log_string += f"""\033[1m{f" Learning iteration {it}/{total_it} ".center(width)}\033[0m \n"""
 
             # Print run name if provided
             run_name = self.cfg.get("run_name")
@@ -259,8 +260,6 @@ class Logger:
                     log_string += f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(self.irewbuffer):.2f}\n"""
                 log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
                 log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
-                if self.use_amp and len(self.amp_rewbuffer) > 0:
-                    log_string += f"""{"Mean Episode_Reward/amp:":>{pad}} {statistics.mean(self.amp_rewbuffer):.2f}\n"""
 
             # Print noise std
             log_string += f"""{"Mean action noise std:":>{pad}} {action_std.mean().item():.2f}\n"""
@@ -268,6 +267,10 @@ class Logger:
             # Print episode extras
             if not print_minimal:
                 log_string += extras_string
+
+            # Print AMP episode reward at the end of the main body for readability.
+            if len(self.rewbuffer) > 0 and self.use_amp and len(self.amp_rewbuffer) > 0:
+                log_string += f"""{"Episode_Reward/amp:":>{pad}} {statistics.mean(self.amp_rewbuffer):.2f}\n"""
 
             # Print footer
             done_it = it + 1 - start_it
